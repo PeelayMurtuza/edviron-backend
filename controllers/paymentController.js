@@ -13,25 +13,18 @@ const API_KEY =
 const SCHOOL_ID = process.env.SCHOOL_ID || "65b0e6293e9f76a9694d84b4";
 
 /**
- * Create Payment
+ * ✅ Create Payment
  */
 exports.createPayment = async (req, res) => {
   try {
     const { trustee_id, student_info, gateway_name, amount, callback_url } = req.body;
 
-    // 1. Create sign (JWT)
     const payload = { school_id: SCHOOL_ID, amount, callback_url };
     const sign = jwt.sign(payload, PG_KEY);
 
-    // 2. Call Edviron API
     const response = await axios.post(
       "https://dev-vanilla.edviron.com/erp/create-collect-request",
-      {
-        school_id: SCHOOL_ID,
-        amount,
-        callback_url,
-        sign,
-      },
+      { school_id: SCHOOL_ID, amount, callback_url, sign },
       {
         headers: {
           "Content-Type": "application/json",
@@ -42,7 +35,6 @@ exports.createPayment = async (req, res) => {
 
     const { collect_request_id, Collect_request_url } = response.data;
 
-    // 3. Save Order
     await Order.create({
       _id: collect_request_id,
       school_id: SCHOOL_ID,
@@ -51,7 +43,6 @@ exports.createPayment = async (req, res) => {
       gateway_name,
     });
 
-    // 4. Save initial OrderStatus
     await OrderStatus.create({
       collect_id: collect_request_id,
       order_amount: amount,
@@ -75,7 +66,7 @@ exports.createPayment = async (req, res) => {
 };
 
 /**
- * Webhook handler
+ * ✅ Webhook handler
  */
 exports.webhook = async (req, res) => {
   try {
@@ -109,7 +100,7 @@ exports.webhook = async (req, res) => {
 };
 
 /**
- * Fetch All Transactions (pagination + sorting)
+ * ✅ Fetch All Transactions (search + status + date + pagination + sorting)
  */
 exports.getTransactions = async (req, res) => {
   try {
@@ -119,83 +110,34 @@ exports.getTransactions = async (req, res) => {
     const sortOrder = req.query.sortOrder === "asc" ? 1 : -1;
     const skip = (page - 1) * limit;
 
-    const pipeline = [
-      {
-        $lookup: {
-          from: "orderstatuses",
-          let: { orderIdStr: { $toString: "$_id" } },
-          pipeline: [
-            {
-              $match: {
-                $expr: { $eq: [{ $toString: "$collect_id" }, "$$orderIdStr"] },
-              },
-            },
-          ],
-          as: "status_info",
-        },
-      },
-      { $unwind: { path: "$status_info", preserveNullAndEmptyArrays: true } },
-      {
-        $project: {
-          collect_id: { $ifNull: [{ $toString: "$_id" }, null] },
-          school_id: 1,
-          gateway: "$gateway_name",
-          order_amount: { $ifNull: ["$status_info.order_amount", null] },
-          transaction_amount: { $ifNull: ["$status_info.transaction_amount", null] },
-          status: { $ifNull: ["$status_info.status", null] },
-          payment_time: { $ifNull: ["$status_info.payment_time", null] },
-          status_info: 1,
-        },
-      },
-      { $sort: { [sortField]: sortOrder } },
-      {
-        $facet: {
-          data: [{ $skip: skip }, { $limit: limit }],
-          totalCount: [{ $count: "count" }],
-        },
-      },
-      { $unwind: { path: "$totalCount", preserveNullAndEmptyArrays: true } },
-      { $project: { data: 1, total: { $ifNull: ["$totalCount.count", 0] } } },
-    ];
+    const { search, status, dateFrom, dateTo } = req.query;
+    let matchStage = {};
 
-    const aggResult = await Order.aggregate(pipeline);
-    const doc = aggResult[0] || { data: [], total: 0 };
-    const data = doc.data || [];
-    const total = doc.total || 0;
+    // 🔍 Search
+    if (search) {
+      const orConditions = [{ custom_order_id: search }];
+      if (mongoose.Types.ObjectId.isValid(search)) {
+        orConditions.push({ _id: new mongoose.Types.ObjectId(search) });
+      }
+      orConditions.push({ _id: search });
+      matchStage.$or = orConditions;
+    }
 
-    res.json({
-      page,
-      limit,
-      total,
-      totalPages: Math.max(1, Math.ceil(total / limit)),
-      data,
-    });
-  } catch (err) {
-    console.error("getTransactions error:", err);
-    res.status(500).json({ error: err.message });
-  }
-};
+    // 🎯 Status
+    if (status) {
+      matchStage["status_info.status"] = Array.isArray(status)
+        ? { $in: status }
+        : status;
+    }
 
-/**
- * Fetch transactions by school
- */
-exports.getTransactionsBySchool = async (req, res) => {
-  try {
-    const { schoolId } = req.params;
-    const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.max(1, parseInt(req.query.limit) || 10);
-    const sortField = req.query.sortField || "status_info.payment_time";
-    const sortOrder = req.query.sortOrder === "asc" ? 1 : -1;
-    const skip = (page - 1) * limit;
+    // 📅 Date range
+    if (dateFrom || dateTo) {
+      matchStage["status_info.payment_time"] = {};
+      if (dateFrom) matchStage["status_info.payment_time"].$gte = new Date(dateFrom);
+      if (dateTo) matchStage["status_info.payment_time"].$lte = new Date(dateTo);
+    }
 
     const pipeline = [
-      {
-        $match: {
-          school_id: mongoose.Types.ObjectId.isValid(schoolId)
-            ? new mongoose.Types.ObjectId(schoolId)
-            : schoolId,
-        },
-      },
       {
         $lookup: {
           from: "orderstatuses",
@@ -219,6 +161,7 @@ exports.getTransactionsBySchool = async (req, res) => {
           status_info: 1,
         },
       },
+      ...(Object.keys(matchStage).length > 0 ? [{ $match: matchStage }] : []),
       { $sort: { [sortField]: sortOrder } },
       {
         $facet: {
@@ -232,15 +175,109 @@ exports.getTransactionsBySchool = async (req, res) => {
 
     const aggResult = await Order.aggregate(pipeline);
     const doc = aggResult[0] || { data: [], total: 0 };
-    const data = doc.data || [];
-    const total = doc.total || 0;
 
     res.json({
       page,
       limit,
-      total,
-      totalPages: Math.max(1, Math.ceil(total / limit)),
-      data,
+      total: doc.total || 0,
+      totalPages: Math.max(1, Math.ceil((doc.total || 0) / limit)),
+      data: doc.data || [],
+    });
+  } catch (err) {
+    console.error("getTransactions error:", err);
+    res.status(500).json({ error: err.message });
+  }
+};
+
+/**
+ * ✅ Fetch Transactions By School (with filters)
+ */
+exports.getTransactionsBySchool = async (req, res) => {
+  try {
+    const { schoolId } = req.params;
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.max(1, parseInt(req.query.limit) || 10);
+    const sortField = req.query.sortField || "status_info.payment_time";
+    const sortOrder = req.query.sortOrder === "asc" ? 1 : -1;
+    const skip = (page - 1) * limit;
+
+    const { search, status, dateFrom, dateTo } = req.query;
+    let matchStage = {
+      school_id: mongoose.Types.ObjectId.isValid(schoolId)
+        ? new mongoose.Types.ObjectId(schoolId)
+        : schoolId,
+    };
+
+    // 🔍 Search
+    if (search) {
+      const orConditions = [{ custom_order_id: search }];
+      if (mongoose.Types.ObjectId.isValid(search)) {
+        orConditions.push({ _id: new mongoose.Types.ObjectId(search) });
+      }
+      orConditions.push({ _id: search });
+      matchStage.$or = orConditions;
+    }
+
+    // 🎯 Status
+    if (status) {
+      matchStage["status_info.status"] = Array.isArray(status)
+        ? { $in: status }
+        : status;
+    }
+
+    // 📅 Date range
+    if (dateFrom || dateTo) {
+      matchStage["status_info.payment_time"] = {};
+      if (dateFrom) matchStage["status_info.payment_time"].$gte = new Date(dateFrom);
+      if (dateTo) matchStage["status_info.payment_time"].$lte = new Date(dateTo);
+    }
+
+    const pipeline = [
+      { $match: { school_id: matchStage.school_id } },
+      {
+        $lookup: {
+          from: "orderstatuses",
+          let: { orderIdStr: { $toString: "$_id" } },
+          pipeline: [
+            { $match: { $expr: { $eq: [{ $toString: "$collect_id" }, "$$orderIdStr"] } } },
+          ],
+          as: "status_info",
+        },
+      },
+      { $unwind: { path: "$status_info", preserveNullAndEmptyArrays: true } },
+      {
+        $project: {
+          collect_id: { $ifNull: [{ $toString: "$_id" }, null] },
+          school_id: 1,
+          gateway: "$gateway_name",
+          order_amount: { $ifNull: ["$status_info.order_amount", null] },
+          transaction_amount: { $ifNull: ["$status_info.transaction_amount", null] },
+          status: { $ifNull: ["$status_info.status", null] },
+          payment_time: { $ifNull: ["$status_info.payment_time", null] },
+          status_info: 1,
+        },
+      },
+      ...(Object.keys(matchStage).length > 1 ? [{ $match: matchStage }] : []),
+      { $sort: { [sortField]: sortOrder } },
+      {
+        $facet: {
+          data: [{ $skip: skip }, { $limit: limit }],
+          totalCount: [{ $count: "count" }],
+        },
+      },
+      { $unwind: { path: "$totalCount", preserveNullAndEmptyArrays: true } },
+      { $project: { data: 1, total: { $ifNull: ["$totalCount.count", 0] } } },
+    ];
+
+    const aggResult = await Order.aggregate(pipeline);
+    const doc = aggResult[0] || { data: [], total: 0 };
+
+    res.json({
+      page,
+      limit,
+      total: doc.total || 0,
+      totalPages: Math.max(1, Math.ceil((doc.total || 0) / limit)),
+      data: doc.data || [],
     });
   } catch (err) {
     console.error("getTransactionsBySchool error:", err);
@@ -249,7 +286,7 @@ exports.getTransactionsBySchool = async (req, res) => {
 };
 
 /**
- * Check Transaction Status
+ * ✅ Check Transaction Status
  */
 exports.getTransactionStatus = async (req, res) => {
   try {
