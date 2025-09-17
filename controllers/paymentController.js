@@ -3,8 +3,8 @@
 const axios = require("axios");
 const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
-const Order = require("../models/Order");
-const OrderStatus = require("../models/OrderStatus");
+const Order = require("../models/order");
+const OrderStatus = require("../models/orderStatus");
 
 const PG_KEY = process.env.PG_KEY || "edvtest01";
 const API_KEY =
